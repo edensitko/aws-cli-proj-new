@@ -1,164 +1,171 @@
-
 #!/bin/bash
-set -x
-set -e
+set -euo pipefail 
 
-# Variables - Change these values!
-AMI_ID=""
-RED_SUBNET_ID="" 
-BLUE_SUBNET_ID=""
-VPC_ID=""
-REGION=""              
-SG_NAME="" 
-ALB_NAME=""
+############################################
+#            VARIABLES                     #
+AMI_ID="ami-08b5b3a93ed654d19"
+RED_SUBNET_ID="subnet-07daf692c09286bb3" 
+BLUE_SUBNET_ID="subnet-0d687f0d29ad6415a"
+VPC_ID="vpc-07edc3e691f6f6d50"
+REGION="us-east-1"           
+SG_NAME="alb-security-group-1" 
+ALB_NAME="alb-name"
 TG_RED="tg-red"
 TG_BLUE="tg-blue"
+###########################################
 
-####################################################
-# 1) Check if Security Group with SG_NAME already exists
-####################################################
-
-EXISTING_SG_ID=$(aws ec2 describe-security-groups \
-  --region $REGION \
-  --filters Name=group-name,Values=$SG_NAME Name=vpc-id,Values=$VPC_ID \
-  --query 'SecurityGroups[0].GroupId' \
-  --output text 2>/dev/null)
-
-if [ "$EXISTING_SG_ID" = "None" ] || [ "$EXISTING_SG_ID" = "" ]; then
-  echo "Creating new Security Group: $SG_NAME"
-  SG_ID=$(aws ec2 create-security-group \
-    --region $REGION \
-    --group-name $SG_NAME \
-    --description "Allow HTTP" \
-    --vpc-id $VPC_ID \
-    --query 'GroupId' \
-    --output text)
-  echo "Security Group Created: $SG_ID"
-else
-  echo "Security Group $SG_NAME already exists. Reusing it..."
-  SG_ID=$EXISTING_SG_ID
+# Get default VPC ID
+VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true \
+          --query "Vpcs[0].VpcId" --output text)
+if [[ -z "$VPC_ID" || "$VPC_ID" == "None" ]]; then
+    echo "Error: No default VPC found. Exiting." >&2
+    exit 1
 fi
 
-echo "Security Group ID: $SG_ID"
+# Get two subnets in default VPC
+SUBNETS=($(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC_ID \
+          --query 'Subnets[0:2].SubnetId' --output text))
+if [[ ${#SUBNETS[@]} -ne 2 ]]; then
+    echo "Error: Less than two subnets found in VPC $VPC_ID. Cannot create ALB." >&2
+    exit 1
+fi
+SUBNET_1=${SUBNETS[0]}
+SUBNET_2=${SUBNETS[1]}
 
-######################################################
-# 2) Add ingress rule for HTTP if needed
-######################################################
-aws ec2 authorize-security-group-ingress \
-  --region $REGION \
-  --group-id $SG_ID \
-  --protocol tcp --port 80 --cidr 0.0.0.0/0 \
-  2>/dev/null || echo "Ingress rule for port 80 might already exist."  
+# Get latest Amazon Linux 2 AMI
+AMI_ID=$(aws ssm get-parameters --names "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2" \
+          --query "Parameters[0].Value" --output text)
 
-# Create Target Groups
-aws elbv2 create-target-group \
-  --name $TG_RED \
-  --protocol HTTP --port 80 \
-  --vpc-id $VPC_ID \
-  --region $REGION 2>/dev/null || echo "Target group $TG_RED might already exist."  
+INSTANCE_TYPE="t2.micro"
+ALB_NAME="my-alb"
+TG_RED_NAME="tg-red"
+TG_BLUE_NAME="tg-blue"
+SG_NAME="alb-sg"
 
-echo "Target Group created or exists: $TG_RED"
+############################################
+#        1. CREATE/REUSE SECURITY GROUP    #
+############################################
+SG_ID=$(aws ec2 describe-security-groups --filters Name=group-name,Values="$SG_NAME" \
+          --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "")
 
-aws elbv2 create-target-group \
-  --name $TG_BLUE \
-  --protocol HTTP --port 80 \
-  --vpc-id $VPC_ID \
-  --region $REGION 2>/dev/null || echo "Target group $TG_BLUE might already exist."  
+if [[ -z "$SG_ID" || "$SG_ID" == "None" ]]; then
+    SG_ID=$(aws ec2 create-security-group --group-name "$SG_NAME" \
+        --description "Allow HTTP traffic" --vpc-id "$VPC_ID" \
+        --query 'GroupId' --output text)
+    echo "✅ Security Group Created: $SG_ID"
+else
+    echo "✅ Security Group Exists: $SG_ID"
+fi
 
-echo "Target Group created or exists: $TG_BLUE"
+# Open port 80 if not already open
+aws ec2 authorize-security-group-ingress --group-id "$SG_ID" \
+    --protocol tcp --port 80 --cidr 0.0.0.0/0 || echo "Port 80 rule already exists."
 
-# UserData for Red Instance
-cat > userdata_red.sh <<EOF
+############################################
+#   2. DELETE EXISTING TARGET GROUPS       #
+############################################
+for TG_NAME in "$TG_RED_NAME" "$TG_BLUE_NAME"; do
+    EXISTING_TG_ARN=$(aws elbv2 describe-target-groups --names "$TG_NAME" \
+                      --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "")
+
+    if [[ -n "$EXISTING_TG_ARN" && "$EXISTING_TG_ARN" != "None" ]]; then
+        echo "⚠️  Deleting existing Target Group: $TG_NAME..."
+        aws elbv2 delete-target-group --target-group-arn "$EXISTING_TG_ARN"
+        sleep 5  # Wait for deletion to complete
+    fi
+done
+
+############################################
+#   3. CREATE TARGET GROUPS                #
+############################################
+TG_RED_ARN=$(aws elbv2 create-target-group --name "$TG_RED_NAME" --protocol HTTP --port 80 \
+              --vpc-id "$VPC_ID" --target-type instance \
+              --health-check-path "/red/index.html" \
+              --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+TG_BLUE_ARN=$(aws elbv2 create-target-group --name "$TG_BLUE_NAME" --protocol HTTP --port 80 \
+              --vpc-id "$VPC_ID" --target-type instance \
+              --health-check-path "/blue/index.html" \
+              --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+############################################
+#   4. CREATE USER DATA FOR EC2 INSTANCES  #
+############################################
+cat > user-data-red.sh << 'EOF'
 #!/bin/bash
-# Commenting out yum update to avoid internet requirement
-# yum update -y
-yum install -y nginx
-mkdir -p /usr/share/nginx/html/red
-echo "<h1 style='color:red;'>Red Service</h1>" > /usr/share/nginx/html/red/index.html
-cat > /etc/nginx/conf.d/red.conf <<EOC
-server {
-    listen 80;
-    location /red/ {
-        root /usr/share/nginx/html;
-    }
-}
-EOC
-systemctl enable nginx
-systemctl start nginx
+yum install -y httpd
+systemctl enable httpd
+systemctl start httpd
+
+mkdir -p /var/www/html/red
+echo "<h1 style='color:red;'>Welcome to the RED service</h1>" > /var/www/html/red/index.html
 EOF
 
-# Launch Red EC2
-echo "Launching Red EC2..."
-RED_INSTANCE_ID=$(aws ec2 run-instances \
-  --region $REGION \
-  --image-id $AMI_ID \
-  --instance-type t2.micro \
-  --security-group-ids $SG_ID \
-  --user-data file://userdata_red.sh \
-  --subnet-id $RED_SUBNET_ID \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=Red}]' \
-  --query 'Instances[0].InstanceId' \
-  --output text)
-
-echo "Launched Red instance: $RED_INSTANCE_ID"
-
-# UserData for Blue Instance
-cat > userdata_blue.sh <<EOF
+cat > user-data-blue.sh << 'EOF'
 #!/bin/bash
-# Commenting out yum update to avoid internet requirement
-# yum update -y
-yum install -y nginx
-# Removed EFS mount by default:
-# yum install -y amazon-efs-utils
-# mkdir -p /mnt/blue-efs
-# mount -t efs fs-xxxxxxxx.efs.
-# ${REGION}.amazonaws.com:/ /mnt/blue-efs
+yum install -y httpd
+systemctl enable httpd
+systemctl start httpd
 
-mkdir -p /usr/share/nginx/html/blue
-echo "<h1 style='color:blue;'>Blue Service</h1>" > /usr/share/nginx/html/blue/index.html
-cat > /etc/nginx/conf.d/blue.conf <<EOC
-server {
-    listen 80;
-    location / {
-        root /usr/share/nginx/html/blue;
-    }
-}
-EOC
-systemctl enable nginx
-systemctl start nginx
+mkdir -p /var/www/html/blue
+echo "<h1 style='color:blue;'>Welcome to the BLUE service</h1>" > /var/www/html/blue/index.html
 EOF
 
-echo "Launching Blue EC2..."
-BLUE_INSTANCE_ID=$(aws ec2 run-instances \
-  --region $REGION \
-  --image-id $AMI_ID \
-  --instance-type t2.micro \
-  --security-group-ids $SG_ID \
-  --user-data file://userdata_blue.sh \
-  --subnet-id $BLUE_SUBNET_ID \
-  --query 'Instances[0].InstanceId' \
-  --output text \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=Blue}]')
+############################################
+#       5. LAUNCH EC2 INSTANCES            #
+############################################
+INSTANCE1_ID=$(aws ec2 run-instances --image-id $AMI_ID --instance-type $INSTANCE_TYPE \
+                 --security-group-ids $SG_ID --subnet-id $SUBNET_1 \
+                 --user-data file://user-data-red.sh \
+                 --query 'Instances[0].InstanceId' --output text)
+echo "✅ Launched RED instance: $INSTANCE1_ID"
 
-echo "Launched Blue instance: $BLUE_INSTANCE_ID"
+INSTANCE2_ID=$(aws ec2 run-instances --image-id $AMI_ID --instance-type $INSTANCE_TYPE \
+                 --security-group-ids $SG_ID --subnet-id $SUBNET_2 \
+                 --user-data file://user-data-blue.sh \
+                 --query 'Instances[0].InstanceId' --output text)
+echo "✅ Launched BLUE instance: $INSTANCE2_ID"
 
-sleep 20
+aws ec2 wait instance-status-ok --instance-ids $INSTANCE1_ID $INSTANCE2_ID
+echo "✅ Both EC2 instances are running and healthy"
 
-echo "Getting Public IP of Red..."
-RED_IP=$(aws ec2 describe-instances \
-  --region $REGION \
-  --instance-ids $RED_INSTANCE_ID \
-  --query 'Reservations[0].Instances[0].PublicIpAddress' \
-  --output text)
+############################################
+#   6. CREATE LOAD BALANCER                #
+############################################
+ALB_ARN=$(aws elbv2 create-load-balancer --name "$ALB_NAME" \
+              --scheme internet-facing --security-groups $SG_ID \
+              --subnets "$SUBNET_1" "$SUBNET_2" \
+              --query 'LoadBalancers[0].LoadBalancerArn' --output text)
 
-echo "Getting Public IP of Blue..."
-BLUE_IP=$(aws ec2 describe-instances \
-  --region $REGION \
-  --instance-ids $BLUE_INSTANCE_ID \
-  --query 'Reservations[0].Instances[0].PublicIpAddress' \
-  --output text)
+aws elbv2 wait load-balancer-available --load-balancer-arns $ALB_ARN
+echo "✅ ALB is now available"
 
-echo "========================================"
-echo "Red Service URL:   http://$RED_IP/red"
-echo "Blue Service URL:  http://$BLUE_IP/"
-echo "========================================"
+############################################
+#   7. CREATE LISTENER & ROUTING RULES     #
+############################################
+LISTENER_ARN=$(aws elbv2 create-listener --load-balancer-arn $ALB_ARN \
+                   --protocol HTTP --port 80 \
+                   --default-actions Type=forward,TargetGroupArn=$TG_RED_ARN \
+                   --query 'Listeners[0].ListenerArn' --output text)
+
+aws elbv2 create-rule --listener-arn $LISTENER_ARN --priority 10 \
+    --conditions Field=path-pattern,Values='/blue*' \
+    --actions Type=forward,TargetGroupArn=$TG_BLUE_ARN > /dev/null
+echo "✅ Added rule: if path is /blue* -> forward to tg-blue"
+
+############################################
+#   8. REGISTER INSTANCES TO TARGET GROUPS #
+############################################
+aws elbv2 register-targets --target-group-arn $TG_RED_ARN --targets Id=$INSTANCE1_ID
+aws elbv2 register-targets --target-group-arn $TG_BLUE_ARN --targets Id=$INSTANCE2_ID
+
+aws elbv2 wait target-in-service --target-group-arn $TG_RED_ARN
+aws elbv2 wait target-in-service --target-group-arn $TG_BLUE_ARN
+
+############################################
+#   9. FINAL OUTPUT                        #
+############################################
+ALB_DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns $ALB_ARN --query 'LoadBalancers[0].DNSName' --output text)
+echo "✅ Deployment Complete!"
+echo "Red:  http://$ALB_DNS/red"
+echo "Blue: http://$ALB_DNS/blue"
